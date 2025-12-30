@@ -12,7 +12,7 @@ from table_al import TableAL
 # ============================================================
 # 設定
 # ============================================================
-CSV_PATH = "../ISLD-export/ISLD-export.csv"
+CSV_PATH = "../../ISLD-export/ISLD-export.csv"
 DB_PATH = "work.sqlite"
 
 GEN_COLS = ("3G", "4G", "5G")  # 世代フラグ列
