@@ -1,48 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# DIPG_PATF_IDでユニーク化
+# make_base_filtered_tableを新しくした
 
 """
-統合分析スクリプト（get/normal は 1 回だけ）
+ISLD 統合分析スクリプト（get/normal は 1 回だけ）
 
-追加仕様（今回の変更点）
-- fd_tno_<scope>_<gen>_uq（= TSTRNUM のユニーク後FD）について
-  「上位10件のラベル（TSTRNUM）」を自動抽出し、
-  6通り（3G/4G/5G × ALL/JP）の allowlist（TSTR_ALLOWLIST_MAP）へ格納する。
-  ※「ラベル側ね」＝ counts ではなく labels を入れる。
+要点
+- DIPG_PATF_ID でユニーク化
+- TS/TR番号（TSTRNUM=3GPP_Type + "_" + TGPP_NUMBER）でFDを作成
+- fd_tno_<scope>_<gen>_uq の上位N件（labels）を allowlist に自動格納
+- allowlist を用いて「特定TS/TRのみ」の会社FD（cmp）も作成
 
-動作順序（重要）
-1) run_tstrnum_fd() を実行して fd_tno_* を生成 + allowlist を自動生成
-2) run_company_fd_for_selected_tstr() が allowlist を使って TS/TR限定の会社FDを生成
+実行順（重要）
+1) run_tstrnum_fd() を実行して allowlist を自動生成
+2) run_company_fd_for_selected_tstr() が allowlist を使ってTS/TR限定の会社FDを生成
 """
+
 
 from __future__ import annotations
 
-import sys
 import os
+import sys
+from pathlib import Path
+from typing import Any, Iterable
 
-# このファイルのパスを基準に、../std をパスに追加
-current_dir = os.path.dirname(os.path.abspath(__file__))
-std_path = os.path.abspath(os.path.join(current_dir, '..', 'std'))
-sys.path.insert(0, std_path)
+# ----------------------------------------------------------------------
+# ローカルライブラリパス（../std）を追加
+# ----------------------------------------------------------------------
+SCRIPT_DIR = Path(__file__).resolve().parent
+LIB_DIR = (SCRIPT_DIR / ".." / "std").resolve()
+sys.path.insert(0, str(LIB_DIR))
 
 from table_sql import get, apply_pipeline
 from table_rule import Pipeline
 from normalization import normal
 from table_al import TableAL
 
+
 # ============================================================
 # 入出力設定
 # ============================================================
-CSV_PATH = "../../ISLD-export/ISLD-export.csv"
-DB_PATH = "work.sqlite"
+SOURCE_CSV = Path("../../ISLD-export/ISLD-export.csv")
+SQLITE_DB = Path("work.sqlite")
 
-GEN_COLS = ("3G", "4G", "5G")                     # 入力CSV側の世代フラグ列
-GEN_KEY  = {"3G": "3g", "4G": "4g", "5G": "5g"}   # 命名用キー
+# 入力CSV側の世代フラグ列 / 命名用キー
+GEN_FLAGS = ("3G", "4G", "5G")
+GEN_SUFFIX = {"3G": "3g", "4G": "4g", "5G": "5g"}
 
-# 必要列の「和集合」だけ読み込む（I/O最小化）
-HEADS_ALL = [
+# 必要列の「和集合」だけ読む（I/O最小化）
+SOURCE_COLUMNS = [
     "IPRD_ID",
     "IPRD_SIGNATURE_DATE",
     "COMP_LEGAL_NAME",
@@ -58,101 +65,80 @@ HEADS_ALL = [
     "5G",
 ]
 
-# JP判定
-JP_VALUE = "JP JAPAN"
-
-# TS/TR 連結列（技術仕様番号）
-TSTR_CONNECT_HEADS = ["3GPP_Type", "TGPP_NUMBER"]
-TSTR_COL = "TSTRNUM"
-TSTR_SEP = "_"
-
-# scope 値（固定）
+# scope
 SCOPE_ALL = "all"
-SCOPE_JP  = "jp"
+SCOPE_JP = "jp"
 
+# JP判定
+JP_COUNTRY_VALUE = "JP JAPAN"
 
-# ============================================================
-# TS/TR 限定（allowlist）設定：3G/4G/5G × (ALL/JP) の6通り
-# ============================================================
-# ここは「固定値を入れる場所」でもあるが、
-# 今回は「fd_tno_*_uq の上位10ラベルで自動的に上書きする」運用にする。
-#
-# - 文字列は必ず "TS_38.331" のような TSTRNUM 形式。
-# - 空リストなら「絞り込み無し」になるが、今回の自動生成で基本は埋まる。
-
-# --- 3G（ALL/JP）---
-TSTR_ALLOWLIST_ALL_3G: list[str] = []
-TSTR_ALLOWLIST_JP_3G:  list[str] = []
-
-# --- 4G（ALL/JP）---
-TSTR_ALLOWLIST_ALL_4G: list[str] = []
-TSTR_ALLOWLIST_JP_4G:  list[str] = []
-
-# --- 5G（ALL/JP）---
-TSTR_ALLOWLIST_ALL_5G: list[str] = []
-TSTR_ALLOWLIST_JP_5G:  list[str] = []
-
-# 内部マップ（6通りを確実に返せるようにする）
-TSTR_ALLOWLIST_MAP: dict[tuple[str, str], list[str]] = {
-    ("3G", SCOPE_ALL): TSTR_ALLOWLIST_ALL_3G,
-    ("3G", SCOPE_JP):  TSTR_ALLOWLIST_JP_3G,
-    ("4G", SCOPE_ALL): TSTR_ALLOWLIST_ALL_4G,
-    ("4G", SCOPE_JP):  TSTR_ALLOWLIST_JP_4G,
-    ("5G", SCOPE_ALL): TSTR_ALLOWLIST_ALL_5G,
-    ("5G", SCOPE_JP):  TSTR_ALLOWLIST_JP_5G,
-}
+# TS/TR連結列（技術仕様番号）
+TSTRNUM_PART_COLS = ("3GPP_Type", "TGPP_NUMBER")
+TSTRNUM_COL = "TSTRNUM"
+TSTRNUM_SEP = "_"
 
 # allowlist を適用する世代（必要なら絞る：例 ("5G",)）
-TSTR_FILTER_GEN_COLS = ("3G", "4G", "5G")
+ALLOWLIST_TARGET_GENS = ("3G", "4G", "5G")
 
-# fd_tno_*_uq の「上位N」を allowlist に入れるN
+# fd_tno_*_uq の「上位N」を allowlist に入れる
 TOP_N_TSTRNUM = 10
+
+
+# ============================================================
+# allowlist（3G/4G/5G × ALL/JP の 6 通り）
+# - ここは固定値を入れる場所でもあるが、今回は「上位Nで自動上書き」運用
+# ============================================================
+TSTR_ALLOWLIST_BY_GEN_SCOPE: dict[tuple[str, str], list[str]] = {
+    (g, SCOPE_ALL): []
+    for g in GEN_FLAGS
+}
+TSTR_ALLOWLIST_BY_GEN_SCOPE.update({
+    (g, SCOPE_JP): []
+    for g in GEN_FLAGS
+})
 
 
 # ============================================================
 # 命名ヘルパ
 # ============================================================
-def build_fd_filename(dim: str, scope: str, gen: str, uniq: str, *, tag: str | None = None) -> str:
+def fd_filename(dim: str, scope: str, gen_suffix: str, uniq_tag: str, *, tag: str | None = None) -> str:
     """度数分布CSVの保存ファイル名を組み立てる。"""
-    base = f"fd_{dim}_{scope}_{gen}_{uniq}"
+    base = f"fd_{dim}_{scope}_{gen_suffix}_{uniq_tag}"
     return f"{base}_{tag}.csv" if tag else f"{base}.csv"
 
 
-def build_table_name(dim: str, scope: str, step: str, gen: str, *, tag: str | None = None) -> str:
-    """中間テーブル名を組み立てる（SQLite等で衝突しにくい）。"""
-    base = f"t_{dim}_{scope}_{step}_{gen}"
+def tmp_table_name(dim: str, scope: str, step: str, gen_suffix: str, *, tag: str | None = None) -> str:
+    """中間テーブル名（SQLite等で衝突しにくい）。"""
+    base = f"t_{dim}_{scope}_{step}_{gen_suffix}"
     return f"{base}_{tag}" if tag else base
 
 
-def is_jp_scope(scope: str) -> bool:
+def is_jp(scope: str) -> bool:
     return scope == SCOPE_JP
 
 
 # ============================================================
-# allowlist 取得/更新（6通り対応）
+# allowlist 取得/更新
 # ============================================================
-def get_tstr_allowlist_ref(gen_col: str, scope: str) -> list[str]:
+def allowlist_ref(gen_flag: str, scope: str) -> list[str]:
     """
-    gen_col（"3G"/"4G"/"5G"）と scope（"all"/"jp"）に応じて
-    allowlist の「参照（listオブジェクト）」を返す。
-
-    - 参照を返すので、呼び出し側で allowlist[:] = ... のように更新できる
-    - 想定外入力は空リスト（新規のダミー）を返す（落とさない）
+    (gen_flag, scope) に対応する allowlist の「参照」を返す。
+    参照を返すため、ref[:] = ... で同一オブジェクトのまま更新できる。
     """
-    if gen_col not in GEN_COLS:
+    if gen_flag not in GEN_FLAGS:
         return []
     if scope not in (SCOPE_ALL, SCOPE_JP):
         return []
-    return TSTR_ALLOWLIST_MAP.get((gen_col, scope), [])
+    return TSTR_ALLOWLIST_BY_GEN_SCOPE.get((gen_flag, scope), [])
 
 
-def get_tstr_allowlist(gen_col: str, scope: str) -> list[str]:
-    """参照ではなく値として使う（読み取り用途）。"""
-    return get_tstr_allowlist_ref(gen_col, scope)
+def allowlist_value(gen_flag: str, scope: str) -> list[str]:
+    """読み取り用途（実体は参照と同じ）。"""
+    return allowlist_ref(gen_flag, scope)
 
 
-def _to_int(x) -> int:
-    """countsがstrでも安全に数値化する。"""
+def _to_int(x: Any) -> int:
+    """countsがstr/floatでも安全に数値化する。"""
     try:
         return int(x)
     except Exception:
@@ -162,278 +148,264 @@ def _to_int(x) -> int:
             return 0
 
 
-def pick_top_labels(labels: list[str], counts: list, top_n: int) -> list[str]:
+def top_labels_by_count(labels: list[str], counts: list[Any], top_n: int) -> list[str]:
     """
     labels/counts から count 降順で上位 top_n の labels を返す。
-    - labels が None/空でも落ちない
     """
     pairs = [(lab, _to_int(cnt)) for lab, cnt in zip(labels or [], counts or []) if lab is not None]
     pairs.sort(key=lambda t: t[1], reverse=True)
     return [lab for lab, _cnt in pairs[:top_n]]
 
 
-def update_tstr_allowlist_from_fd(gen_col: str, scope: str, labels_uq: list[str], counts_uq: list, top_n: int) -> None:
+def refresh_allowlist_from_fd(gen_flag: str, scope: str, labels_uq: list[str], counts_uq: list[Any], top_n: int) -> None:
     """
     fd_tno_<scope>_<gen>_uq の結果（labels_uq, counts_uq）から
-    上位 top_n の labels を抽出して、対応する allowlist に格納する（上書き）。
+    上位 top_n の labels を抽出して、対応 allowlist を上書き更新する。
     """
-    ref = get_tstr_allowlist_ref(gen_col, scope)
+    ref = allowlist_ref(gen_flag, scope)
     if ref is None:
         return
-    top_labels = pick_top_labels(labels_uq, counts_uq, top_n)
-    # 参照先リストを「同一オブジェクトのまま」更新する（マップ参照を壊さない）
-    ref[:] = top_labels
-
-
-# ============================================================
-# 共有処理（読み込み/正規化）
-# ============================================================
-def load_source_table():
-    """CSVを必要列だけ読み込む（get）。"""
-    return get(CSV_PATH, db_path=DB_PATH, head=HEADS_ALL)
-
-
-def normalize_table(raw):
-    """正規化（normal）。"""
-    return normal(raw, out_table_name="t_norm")
+    ref[:] = top_labels_by_count(labels_uq, counts_uq, top_n)
 
 
 # ============================================================
 # テーブル生成（フィルタ/連結/ユニーク）
 # ============================================================
-def build_filtered_table(raw_norm, *, scope: str, gen_col: str, out_table: str, return_heads: list[str]):
+def make_base_filtered_table(
+    norm_tbl,
+    *,
+    scope: str,
+    gen_flag: str,
+    out_table: str,
+    return_cols: list[str],
+):
     """
     共通の基本フィルタを適用したテーブル（ユニーク化前）を作る。
 
     条件（AND）:
-      - gen_col == 1
+      - gen_flag == 1
       - Ess_To_Standard == 1
-      - (scope == "jp") の場合: Country_Of_Registration == "JP JAPAN"
+      - Ess_To_Project == 1
+      - DIPG_PATF_ID != -1
+      - Normalized_Patent == 1
+      - scope == "jp" の場合: Country_Of_Registration == "JP JAPAN"
     """
     p = Pipeline()
-    p.where_eq(gen_col, 1)
+    p.where_eq(gen_flag, 1)
+    # p.where_between("IPRD_SIGNATURE_DATE", "2017-01-01", "2025-12-15")
     p.where_eq("Ess_To_Standard", 1)
     p.where_eq("Ess_To_Project", 1)
     p.where_ne("DIPG_PATF_ID", -1)
     p.where_eq("Normalized_Patent", 1)
-    if is_jp_scope(scope):
-        p.where_eq("Country_Of_Registration", JP_VALUE)
+    if is_jp(scope):
+        p.where_eq("Country_Of_Registration", JP_COUNTRY_VALUE)
 
-    return apply_pipeline(raw_norm, p, out_table_name=out_table, return_heads=return_heads)
-
-
-def build_unique_by_DIPG_PATF_ID(tbl, *, out_table: str, return_heads: list[str] | None = None):
-    """DIPG_PATF_IDでユニーク化したテーブル（ユニーク化後）を作る。"""
-    tbl.create_index("DIPG_PATF_ID")  # 速くなることが多い
-    p = Pipeline()
-    p.unique_by("DIPG_PATF_ID")
-    return apply_pipeline(tbl, p, out_table_name=out_table, return_heads=return_heads)
+    return apply_pipeline(norm_tbl, p, out_table_name=out_table, return_heads=return_cols)
 
 
-def build_tstrnum_table(tbl, *, out_table: str, return_heads: list[str]):
-    """TSTRNUMを作る（3GPP_Type + '_' + TGPP_NUMBER）。"""
-    p = Pipeline()
-    p.concat(TSTR_CONNECT_HEADS, TSTR_COL, TSTR_SEP)
-    return apply_pipeline(tbl, p, out_table_name=out_table, return_heads=return_heads)
+def make_unique_by_patf_id(tbl, *, out_table: str, return_cols: list[str] | None = None):
+    """DIPG_PATF_ID でユニーク化したテーブル（ユニーク化後）を作る。"""
+    tbl.create_index("DIPG_PATF_ID")  # 効くことが多い
+    p = Pipeline().unique_by("DIPG_PATF_ID")
+    return apply_pipeline(tbl, p, out_table_name=out_table, return_heads=return_cols)
 
 
-def build_tstrnum_allowlist_table(tbl_with_tstr, *, allowlist: list[str], out_table: str, return_heads: list[str]):
+def add_tstrnum_col(tbl, *, out_table: str, return_cols: list[str]):
+    """TSTRNUM（3GPP_Type + '_' + TGPP_NUMBER）を生成する。"""
+    p = Pipeline().concat(TSTRNUM_PART_COLS, TSTRNUM_COL, TSTRNUM_SEP)
+    return apply_pipeline(tbl, p, out_table_name=out_table, return_heads=return_cols)
+
+
+def filter_by_tstr_allowlist(tbl_with_tstr, *, allowlist: list[str], out_table: str, return_cols: list[str]):
     """
-    TSTRNUMが allowlist に含まれる行だけに絞り込む。
-
-    注意:
-    - allowlist が空の場合は「絞り込み無し」（安全側）として、元テーブルをそのまま返す。
+    TSTRNUM が allowlist に含まれる行だけに絞り込む。
+    allowlist が空なら「絞り込み無し」（安全側）として元テーブルをそのまま返す。
     """
     if not allowlist:
         return tbl_with_tstr
 
-    p = Pipeline()
-    p.where_in(TSTR_COL, allowlist)
-    return apply_pipeline(tbl_with_tstr, p, out_table_name=out_table, return_heads=return_heads)
+    p = Pipeline().where_in(TSTRNUM_COL, allowlist)
+    return apply_pipeline(tbl_with_tstr, p, out_table_name=out_table, return_heads=return_cols)
 
 
 # ============================================================
 # 保存（度数分布）
 # ============================================================
-def save_frequency_distribution_csv(
+def save_fd_csv(
     al: TableAL,
     *,
     labels_nu: list[str],
-    counts_nu: list,
+    counts_nu: list[Any],
     labels_uq: list[str],
-    counts_uq: list,
+    counts_uq: list[Any],
     dim: str,
     scope: str,
-    gen: str,
+    gen_suffix: str,
     tag: str | None = None,
 ):
     """度数分布（labels/counts）を（ユニーク前/後）でCSV保存する。"""
-    al.save_as_file((labels_nu, counts_nu), build_fd_filename(dim, scope, gen, "nu", tag=tag))
-    al.save_as_file((labels_uq, counts_uq), build_fd_filename(dim, scope, gen, "uq", tag=tag))
+    al.save_as_file((labels_nu, counts_nu), fd_filename(dim, scope, gen_suffix, "nu", tag=tag))
+    al.save_as_file((labels_uq, counts_uq), fd_filename(dim, scope, gen_suffix, "uq", tag=tag))
 
 
 # ============================================================
 # ジョブA: 会社別FD（cmp）
 # ============================================================
-def run_company_fd(raw_norm, *, scope: str, al: TableAL) -> None:
+def run_company_fd(norm_tbl, *, scope: str, al: TableAL) -> None:
     """cmp（COMP_LEGAL_NAME）の度数分布を作る（3g/4g/5gをまとめて実行）。"""
     dim = "cmp"
-    heads_needed = ["DIPG_PATF_ID", "COMP_LEGAL_NAME"]
+    cols_needed = ["DIPG_PATF_ID", "COMP_LEGAL_NAME"]
 
-    for gen_col in GEN_COLS:
-        gen = GEN_KEY[gen_col]
+    for gen_flag in GEN_FLAGS:
+        gen_suffix = GEN_SUFFIX[gen_flag]
 
-        t_filtered = build_filtered_table(
-            raw_norm,
+        t_filtered = make_base_filtered_table(
+            norm_tbl,
             scope=scope,
-            gen_col=gen_col,
-            out_table=build_table_name(dim, scope, "flt", gen),
-            return_heads=heads_needed,
+            gen_flag=gen_flag,
+            out_table=tmp_table_name(dim, scope, "flt", gen_suffix),
+            return_cols=cols_needed,
         )
 
-        t_unique = build_unique_by_DIPG_PATF_ID(
+        t_unique = make_unique_by_patf_id(
             t_filtered,
-            out_table=build_table_name(dim, scope, "uq", gen),
-            return_heads=heads_needed,
+            out_table=tmp_table_name(dim, scope, "uq", gen_suffix),
+            return_cols=cols_needed,
         )
 
         labels_nu, counts_nu = al.frequency_distribution(t_filtered, "COMP_LEGAL_NAME")
         labels_uq, counts_uq = al.frequency_distribution(t_unique,  "COMP_LEGAL_NAME")
 
-        save_frequency_distribution_csv(
+        save_fd_csv(
             al,
             labels_nu=labels_nu, counts_nu=counts_nu,
             labels_uq=labels_uq, counts_uq=counts_uq,
-            dim=dim, scope=scope, gen=gen,
+            dim=dim, scope=scope, gen_suffix=gen_suffix,
         )
 
 
 # ============================================================
-# ジョブB: TS/TR番号別FD（tno） + 上位10ラベルを allowlist に格納
+# ジョブB: TS/TR番号別FD（tno） + 上位Nラベルを allowlist に格納
 # ============================================================
-def run_tstrnum_fd(raw_norm, *, scope: str, al: TableAL) -> None:
+def run_tstrnum_fd(norm_tbl, *, scope: str, al: TableAL) -> None:
     """
     tno（TSTRNUM）の度数分布を作る（3g/4g/5gをまとめて実行）。
 
     追加:
-    - fd_tno_<scope>_<gen>_uq の「上位10ラベル（TSTRNUM）」を
-      TSTR_ALLOWLIST_MAP[(gen_col, scope)] に格納する。
+    - fd_tno_<scope>_<gen>_uq の「上位Nラベル（TSTRNUM）」を allowlist に格納する。
     """
     dim = "tno"
-    heads_for_concat = ["DIPG_PATF_ID", "3GPP_Type", "TGPP_NUMBER"]
+    cols_for_concat = ["DIPG_PATF_ID", "3GPP_Type", "TGPP_NUMBER"]
 
-    for gen_col in GEN_COLS:
-        gen = GEN_KEY[gen_col]
+    for gen_flag in GEN_FLAGS:
+        gen_suffix = GEN_SUFFIX[gen_flag]
 
-        # まず基本フィルタ
-        t_filtered = build_filtered_table(
-            raw_norm,
+        # 1) 基本フィルタ
+        t_filtered = make_base_filtered_table(
+            norm_tbl,
             scope=scope,
-            gen_col=gen_col,
-            out_table=build_table_name(dim, scope, "flt", gen),
-            return_heads=heads_for_concat,
+            gen_flag=gen_flag,
+            out_table=tmp_table_name(dim, scope, "flt", gen_suffix),
+            return_cols=cols_for_concat,
         )
 
-        # TSTRNUM生成（concat）
-        t_with_tstr = build_tstrnum_table(
+        # 2) TSTRNUM生成（concat）
+        t_with_tstr = add_tstrnum_col(
             t_filtered,
-            out_table=build_table_name(dim, scope, "cat", gen),
-            return_heads=["DIPG_PATF_ID", TSTR_COL],
+            out_table=tmp_table_name(dim, scope, "cat", gen_suffix),
+            return_cols=["DIPG_PATF_ID", TSTRNUM_COL],
         )
 
-        # DIPG_PATF_IDでユニーク化
-        t_unique = build_unique_by_DIPG_PATF_ID(
+        # 3) DIPG_PATF_IDでユニーク化
+        t_unique = make_unique_by_patf_id(
             t_with_tstr,
-            out_table=build_table_name(dim, scope, "uq", gen),
-            return_heads=["DIPG_PATF_ID", TSTR_COL],
+            out_table=tmp_table_name(dim, scope, "uq", gen_suffix),
+            return_cols=["DIPG_PATF_ID", TSTRNUM_COL],
         )
 
-        # FD（ユニーク前/後）
-        labels_nu, counts_nu = al.frequency_distribution(t_with_tstr, TSTR_COL)
-        labels_uq, counts_uq = al.frequency_distribution(t_unique,    TSTR_COL)
+        # 4) FD（ユニーク前/後）
+        labels_nu, counts_nu = al.frequency_distribution(t_with_tstr, TSTRNUM_COL)
+        labels_uq, counts_uq = al.frequency_distribution(t_unique,    TSTRNUM_COL)
 
-        save_frequency_distribution_csv(
+        save_fd_csv(
             al,
             labels_nu=labels_nu, counts_nu=counts_nu,
             labels_uq=labels_uq, counts_uq=counts_uq,
-            dim=dim, scope=scope, gen=gen,
+            dim=dim, scope=scope, gen_suffix=gen_suffix,
         )
 
-        # ★ ここが今回の要件：
-        # fd_tno_<scope>_<gen>_uq の上位10ラベルを allowlist に入れる
-        update_tstr_allowlist_from_fd(gen_col, scope, labels_uq, counts_uq, TOP_N_TSTRNUM)
+        # 5) ★上位Nラベルを allowlist に反映（labels側のみ）
+        refresh_allowlist_from_fd(gen_flag, scope, labels_uq, counts_uq, TOP_N_TSTRNUM)
 
 
 # ============================================================
 # ジョブC: 会社別FD（cmp）を「特定TS/TR番号だけ」に限定して集計
 # ============================================================
-def run_company_fd_for_selected_tstr(raw_norm, *, scope: str, al: TableAL) -> None:
+def run_company_fd_for_selected_tstr(norm_tbl, *, scope: str, al: TableAL) -> None:
     """
     cmp（COMP_LEGAL_NAME）の度数分布を作るが、先に TSTRNUM allowlist で行を絞り込む。
 
-    allowlist は run_tstrnum_fd() により自動生成された
-    TSTR_ALLOWLIST_MAP[(gen_col, scope)] を使用する。
+    allowlist は run_tstrnum_fd() により自動生成されたものを使用する。
 
     フロー:
-      1) 基本フィルタ（gen=1 & ess=1 [& jp]）
-      2) TSTRNUM生成（concat）
-      3) allowlist で絞り込み（where_in）
+      1) 基本フィルタ
+      2) TSTRNUM生成
+      3) allowlist 絞り込み（where_in）
       4) DIPG_PATF_IDでユニーク化
-      5) 会社名FDを保存（通常版と区別するため tag="tstr" を付与）
+      5) 会社名FDを保存（tag="tstr" を付与）
     """
     dim = "cmp"
     tag = "tstr"
 
-    # concat するので、Type/Number も必要
-    heads_needed = ["DIPG_PATF_ID", "COMP_LEGAL_NAME", "3GPP_Type", "TGPP_NUMBER"]
+    cols_needed = ["DIPG_PATF_ID", "COMP_LEGAL_NAME", "3GPP_Type", "TGPP_NUMBER"]
 
-    for gen_col in GEN_COLS:
-        if gen_col not in TSTR_FILTER_GEN_COLS:
+    for gen_flag in GEN_FLAGS:
+        if gen_flag not in ALLOWLIST_TARGET_GENS:
             continue
 
-        gen = GEN_KEY[gen_col]
-        allowlist = get_tstr_allowlist(gen_col, scope)
+        gen_suffix = GEN_SUFFIX[gen_flag]
+        allowlist = allowlist_value(gen_flag, scope)
 
         # 1) 基本フィルタ
-        t_filtered = build_filtered_table(
-            raw_norm,
+        t_filtered = make_base_filtered_table(
+            norm_tbl,
             scope=scope,
-            gen_col=gen_col,
-            out_table=build_table_name(dim, scope, "flt", gen, tag=tag),
-            return_heads=heads_needed,
+            gen_flag=gen_flag,
+            out_table=tmp_table_name(dim, scope, "flt", gen_suffix, tag=tag),
+            return_cols=cols_needed,
         )
 
-        # 2) TSTRNUM生成（concat）
-        t_with_tstr = build_tstrnum_table(
+        # 2) TSTRNUM生成
+        t_with_tstr = add_tstrnum_col(
             t_filtered,
-            out_table=build_table_name(dim, scope, "cat", gen, tag=tag),
-            return_heads=["DIPG_PATF_ID", "COMP_LEGAL_NAME", TSTR_COL],
+            out_table=tmp_table_name(dim, scope, "cat", gen_suffix, tag=tag),
+            return_cols=["DIPG_PATF_ID", "COMP_LEGAL_NAME", TSTRNUM_COL],
         )
 
-        # 3) allowlist で絞り込み（空なら絞り込み無し）
-        t_selected = build_tstrnum_allowlist_table(
+        # 3) allowlist 絞り込み（空なら絞り込み無し）
+        t_selected = filter_by_tstr_allowlist(
             t_with_tstr,
             allowlist=allowlist,
-            out_table=build_table_name(dim, scope, "sel", gen, tag=tag),
-            return_heads=["DIPG_PATF_ID", "COMP_LEGAL_NAME", TSTR_COL],
+            out_table=tmp_table_name(dim, scope, "sel", gen_suffix, tag=tag),
+            return_cols=["DIPG_PATF_ID", "COMP_LEGAL_NAME", TSTRNUM_COL],
         )
 
         # 4) DIPG_PATF_IDでユニーク化
-        t_unique = build_unique_by_DIPG_PATF_ID(
+        t_unique = make_unique_by_patf_id(
             t_selected,
-            out_table=build_table_name(dim, scope, "uq", gen, tag=tag),
-            return_heads=["DIPG_PATF_ID", "COMP_LEGAL_NAME"],
+            out_table=tmp_table_name(dim, scope, "uq", gen_suffix, tag=tag),
+            return_cols=["DIPG_PATF_ID", "COMP_LEGAL_NAME"],
         )
 
-        # 5) 会社名FD
+        # 5) FD
         labels_nu, counts_nu = al.frequency_distribution(t_selected, "COMP_LEGAL_NAME")
         labels_uq, counts_uq = al.frequency_distribution(t_unique,  "COMP_LEGAL_NAME")
 
-        save_frequency_distribution_csv(
+        save_fd_csv(
             al,
             labels_nu=labels_nu, counts_nu=counts_nu,
             labels_uq=labels_uq, counts_uq=counts_uq,
-            dim=dim, scope=scope, gen=gen, tag=tag,
+            dim=dim, scope=scope, gen_suffix=gen_suffix, tag=tag,
         )
 
 
@@ -442,21 +414,23 @@ def run_company_fd_for_selected_tstr(raw_norm, *, scope: str, al: TableAL) -> No
 # ============================================================
 def main() -> None:
     al = TableAL()
-    raw = get(CSV_PATH, db_path=DB_PATH, head=HEADS_ALL)
+
+    raw = get(str(SOURCE_CSV), db_path=str(SQLITE_DB), head=SOURCE_COLUMNS)
     try:
-        raw_norm = normal(raw, out_table_name="t_norm")
+        norm_tbl = normal(raw, out_table_name="t_norm")
 
         # A) 会社別FD（通常）
-        run_company_fd(raw_norm, scope=SCOPE_ALL, al=al)
-        run_company_fd(raw_norm, scope=SCOPE_JP,  al=al)
+        run_company_fd(norm_tbl, scope=SCOPE_ALL, al=al)
+        run_company_fd(norm_tbl, scope=SCOPE_JP,  al=al)
 
-        # B) TS/TR番号別FD（通常）＋ allowlist 自動生成（上位10）
-        run_tstrnum_fd(raw_norm, scope=SCOPE_ALL, al=al)
-        run_tstrnum_fd(raw_norm, scope=SCOPE_JP,  al=al)
+        # B) TS/TR番号別FD（通常）＋ allowlist 自動生成（上位N）
+        run_tstrnum_fd(norm_tbl, scope=SCOPE_ALL, al=al)
+        run_tstrnum_fd(norm_tbl, scope=SCOPE_JP,  al=al)
 
         # C) 会社別FD（特定TS/TR番号のみ：allowlistを使用）
-        run_company_fd_for_selected_tstr(raw_norm, scope=SCOPE_ALL, al=al)
-        run_company_fd_for_selected_tstr(raw_norm, scope=SCOPE_JP,  al=al)
+        run_company_fd_for_selected_tstr(norm_tbl, scope=SCOPE_ALL, al=al)
+        run_company_fd_for_selected_tstr(norm_tbl, scope=SCOPE_JP,  al=al)
+
     finally:
         raw.close()
 
