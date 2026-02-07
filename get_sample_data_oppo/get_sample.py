@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+from openpyxl import Workbook
+
 # ----------------------------------------------------------------------
 # ローカルライブラリパス（../std）を追加（指定どおり）
 # ----------------------------------------------------------------------
@@ -20,8 +22,6 @@ from table_rule import Pipeline                # noqa: E402
 from progress import Progress                  # noqa: E402
 from normalization import normal               # noqa: E402
 
-from openpyxl import Workbook                  # noqa: E402
-
 
 # ============================================================
 # ★指定はここにまとめる（全部 Optional）
@@ -32,17 +32,19 @@ TARGET_ETPR_ID: Optional[int] = 133
 TARGET_DIPG_PATF_ID: Optional[int] = 26606
 TARGET_IPRD_REFERENCE: Optional[str] = "ISLD-201704-010"
 
-# サンプル行数（50固定運用）
+# サンプル行数（サンプル系ジョブにだけ適用）
 N = 100
+
+# 会社固定（このスクリプトの主役）
+COMP_COL = "COMP_LEGAL_NAME"
+COMP_VAL = "Guangdong OPPO Mobile Telecommunications Corp Ltd"
+COMPANY_TAG = "OPPO"
 
 # ============================================================
 # 固定入出力
 # ============================================================
 SOURCE_CSV = (SCRIPT_DIR / "../../ISLD-export/ISLD-export.csv").resolve()
 SQLITE_DB = (SCRIPT_DIR / "work.sqlite").resolve()
-
-COMP_COL = "COMP_LEGAL_NAME"
-COMP_VAL = "Guangdong OPPO Mobile Telecommunications Corp Ltd"
 
 
 # ★保存先を ../<COMP_VAL>/ の中にする（Windowsでも安全な名前にする）
@@ -167,19 +169,15 @@ def _progress_done(prog: Any, *, lines: int, table_name: str = "") -> None:
 # ============================================================
 _INVALID_SHEET_CHARS = set(r'[]:*?/\\')
 
-
-def _sanitize_sheet_title(title: str) -> str:
-    s = "".join("_" if ch in _INVALID_SHEET_CHARS else ch for ch in str(title))
-    s = " ".join(s.split()).strip()
+def _safe_sheet_title(title: str) -> str:
+    s = "".join("_" if ch in _INVALID_SHEET_CHARS else ch for ch in title).strip()
     return s or "sheet"
 
-
 def _make_unique_sheet_title(desired: str, used: set[str]) -> str:
-    base = _sanitize_sheet_title(desired)[:31]
+    base = _safe_sheet_title(desired)[:31]
     if base not in used:
         used.add(base)
         return base
-
     n = 1
     while True:
         suffix = f"_{n}"
@@ -192,7 +190,7 @@ def _make_unique_sheet_title(desired: str, used: set[str]) -> str:
 
 
 # ============================================================
-# Pipeline を SQL にコンパイルして直接ストリーム取得（巨大でも中間テーブル作らない）
+# Pipeline を SQL にコンパイルして直接ストリーム取得
 # ============================================================
 def _iter_rows_by_pipeline(norm_tbl, pipeline: Pipeline, *, limit: Optional[int]):
     plan = build_pipeline_sql(pipeline, return_heads=SOURCE_COLUMNS)
@@ -201,18 +199,11 @@ def _iter_rows_by_pipeline(norm_tbl, pipeline: Pipeline, *, limit: Optional[int]
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)
-
     # 返り値は (__src_rownum, *SOURCE_COLUMNS)
     return norm_tbl.conn.execute(sql, tuple(params))
 
 
-def _write_csv_from_cursor(
-    out_csv: Path,
-    cursor,
-    *,
-    show_progress: bool = True,
-    progress_total: Optional[int] = None,
-) -> int:
+def _write_csv_from_cursor(out_csv: Path, cursor, *, show_progress: bool, progress_total: Optional[int] = None) -> int:
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     total = progress_total if progress_total is not None else N
     prog = _progress_new(total=total, every_lines=10) if show_progress else None
@@ -222,8 +213,7 @@ def _write_csv_from_cursor(
         w = csv.writer(f)
         w.writerow(SOURCE_COLUMNS)
         for row in cursor:
-            # row[0] は __src_rownum
-            w.writerow(list(row[1:]))
+            w.writerow(list(row[1:]))  # row[0] は __src_rownum
             written += 1
             _progress_tick(prog, lines=written, table_name=out_csv.name)
 
@@ -250,29 +240,22 @@ def main() -> None:
     if not SOURCE_CSV.exists():
         raise FileNotFoundError(f"not found: {SOURCE_CSV}")
 
-    # ============================================================
-    # jobs: (filename, pipeline, limit)
-    #  - filename は 2桁連番 + 分かりやすいタグ（TARGET_* を含む）
-    #  - TARGET_* はすべて Optional → if val is not None で追加
-    # ============================================================
+    # --------------------------
+    # ジョブ定義
+    # --------------------------
     jobs: list[tuple[str, Pipeline, Optional[int]]] = []
 
-    idx = 1
+    def add_job(tag: str, pipe: Pipeline, limit: Optional[int]) -> None:
+        jobs.append((tag, pipe, limit))
 
-    def add_job(fname_core: str, pipe: Pipeline, lim: Optional[int]) -> None:
-        nonlocal idx
-        jobs.append((f"{idx:02d}_{fname_core}.csv", pipe, lim))
-        idx += 1
-
-    # 01: OPPO 50
+    # 01: 会社サンプル（★where_eq(COMP_COL, COMP_VAL) は絶対に残す）
     add_job(
-        "OPPO_50",
+        f"{COMPANY_TAG}_{N}",
         Pipeline().where_eq(COMP_COL, COMP_VAL),
-        50,
+        N,
     )
 
     # 02-: 「キー=値 の全件抽出」系（似てるのでまとめる）
-    # ※全て Optional → if val is not None で追加
     targets_all = [
         ("TARGET_IPRD_REFERENCE", "IPRD_REFERENCE", TARGET_IPRD_REFERENCE),
         ("TARGET_DIPG_ID", "DIPG_ID", TARGET_DIPG_ID),
@@ -282,68 +265,80 @@ def main() -> None:
     for tag, col, val in targets_all:
         if val is not None:
             add_job(
-                f"{tag}__{val}_ALL",
-                Pipeline().where_eq(col, val),
+                f"{tag}__{val}__ALL",
+                Pipeline()
+                    .where_eq(COMP_COL, COMP_VAL)
+                    .where_eq(col, val),
                 None,
             )
 
-    # 次は「条件付きサンプル」系
+    # 条件付きサンプル（会社条件は必ず入れる）
     add_job(
-        "OPPO_JP_50",
-        Pipeline().where_eq(COMP_COL, COMP_VAL).where_eq("Country_Of_Registration", "JP JAPAN"),
-        50,
+        f"{COMPANY_TAG}_JP_{N}",
+        Pipeline()
+            .where_eq(COMP_COL, COMP_VAL)
+            .where_eq("Country_Of_Registration", "JP JAPAN"),
+        N,
     )
 
     add_job(
-        "OPPO_JP_UNIQ_PBPA_PRIORITY_NUMBERS_50",
+        f"{COMPANY_TAG}_JP_UNIQ_PBPA_PRIORITY_NUMBERS_{N}",
         Pipeline()
             .where_eq(COMP_COL, COMP_VAL)
             .where_eq("Country_Of_Registration", "JP JAPAN")
             .unique_by("PBPA_PRIORITY_NUMBERS"),
-        50,
+        N,
     )
 
     add_job(
-        "OPPO_JP_UNIQ_PATT_APPLICATION_NUMBER_50",
+        f"{COMPANY_TAG}_JP_UNIQ_PATT_APPLICATION_NUMBER_{N}",
         Pipeline()
             .where_eq(COMP_COL, COMP_VAL)
             .where_eq("Country_Of_Registration", "JP JAPAN")
             .unique_by("PATT_APPLICATION_NUMBER"),
-        50,
+        N,
     )
 
     add_job(
-        "OPPO_BASIS_PATENT_50",
+        f"{COMPANY_TAG}_BASIS_PATENT_{N}",
         Pipeline().where_eq(COMP_COL, COMP_VAL).where_eq("Patent_Type", "Basis Patent"),
-        50,
+        N,
     )
 
+    # --------------------------
     # get + normal は1回だけ
+    # --------------------------
     raw = get(str(SOURCE_CSV), db_path=str(SQLITE_DB), head=SOURCE_COLUMNS)
     try:
         norm_tbl = normal(raw, out_table_name="t_norm")
 
         out_csv_paths: list[Path] = []
 
-        for fname, pipe, lim in jobs:
-            out_csv = (OUT_DIR / fname).resolve()
+        for i, (tag, pipe, lim) in enumerate(jobs, start=1):
+            csv_name = f"{i:02d}_{tag}.csv"
+            out_csv = (OUT_DIR / csv_name).resolve()
+
             cur = _iter_rows_by_pipeline(norm_tbl, pipe, limit=lim)
 
-            # lim=None のときは全件なので progressはオフ
-            show_prog = (lim == 50)
-            written = _write_csv_from_cursor(out_csv, cur, show_progress=show_prog)
+            show_prog = (lim is not None)  # サンプル（N指定）のときだけプログレス表示
+            written = _write_csv_from_cursor(
+                out_csv,
+                cur,
+                show_progress=show_prog,
+                progress_total=lim,
+            )
+
             out_csv_paths.append(out_csv)
             print(f"[OK] {out_csv.name}: wrote {written} rows")
 
         # Excel作成（各CSV名＝シート名）
-        total_jobs = len(out_csv_paths)
-        xlsx_path = (OUT_DIR / f"samples__{total_jobs:02d}.xlsx").resolve()
-
+        xlsx_path = (OUT_DIR / f"samples_{COMPANY_TAG}.xlsx").resolve()
         wb = Workbook(write_only=True)
-        used_titles: set[str] = set()
 
+        used_titles: set[str] = set()
         for p in out_csv_paths:
-            title = _make_unique_sheet_title(p.stem, used_titles)
+            desired_title = p.stem
+            title = _make_unique_sheet_title(desired_title, used_titles)
             ws = wb.create_sheet(title=title)
             _csv_to_excel_sheet(ws, p)
 
